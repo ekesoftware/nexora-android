@@ -266,7 +266,13 @@ jobs:
       - name: Build debug APK (canaryUnifiedpush)
         run: |
           set -euo pipefail
-          chmod +x android/gradlew
+          # android/gradlew repoda .gitignore'lu; temiz clone'da yoktur ve
+          # flutter build onu kendi sablonundan enjekte eder.
+          if [ -f android/gradlew ]; then
+            chmod +x android/gradlew
+          else
+            echo "android/gradlew yok — Flutter wrapper'i kendisi enjekte edecek"
+          fi
           EXTRA=()
           if [ "${{ inputs.target_platform || 'all' }}" != "all" ]; then
             EXTRA+=("--target-platform" "${{ inputs.target_platform }}")
