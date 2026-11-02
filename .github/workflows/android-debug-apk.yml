@@ -321,8 +321,10 @@ jobs:
       - name: Verify APK
         run: |
           set -euo pipefail
-          APK=$(find build/app/outputs/flutter-apk -name "app-canaryUnifiedpush-debug*.apk" | head -1)
+          # Flutter cikti dosyasini kucuk harfe cevirir: app-canaryunifiedpush-debug.apk
+          APK=$(find build/app/outputs/flutter-apk -maxdepth 1 -name "*.apk" | head -1)
           [ -n "$APK" ] || { echo "::error::APK bulunamadi"; ls -R build/app/outputs || true; exit 1; }
+          echo "bulunan APK: $APK"
           ls -lh "$APK"
           AAPT2="$ANDROID_HOME/build-tools/${BUILD_TOOLS}/aapt2"
           "$AAPT2" dump badging "$APK" > logs/08-apk-badging.log
@@ -350,7 +352,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: nexora-canary-unifiedpush-debug-apk
-          path: build/app/outputs/flutter-apk/app-canaryUnifiedpush-debug*.apk
+          path: build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 14
 
