@@ -47,10 +47,8 @@ concurrency:
 env:
   FLUTTER_VERSION: "3.47.9"
   JAVA_VERSION: "17"
-  COMPILE_SDK: "36"                 # diger eklentiler icin
-  APP_COMPILE_SDK: "android-37.0"   # uygulama + permission_handler (AGP 9.1.1)
+  COMPILE_SDK: "36"
   BUILD_TOOLS: "36.0.0"
-  BUILD_TOOLS_NEW: "37.0.0"
   NDK_VERSION: "28.2.13676358"
   CMAKE_VERSION: "3.22.1"
 
@@ -151,10 +149,8 @@ jobs:
                  "platforms;android-34" \
                  "platforms;android-35" \
                  "platforms;android-${COMPILE_SDK}" \
-                 "platforms;${APP_COMPILE_SDK}" \
                  "build-tools;35.0.0" \
                  "build-tools;${BUILD_TOOLS}" \
-                 "build-tools;${BUILD_TOOLS_NEW}" \
                  "ndk;${NDK_VERSION}" \
                  "cmake;${CMAKE_VERSION}"; then
               ok=1; break
@@ -222,27 +218,71 @@ jobs:
           set -euo pipefail
           flutter pub get 2>&1 | tee logs/03-pub-get.log
 
-      # ================= 7) (compileSdk yamasi kaldirildi) =================
-      # AGP 9.1.1 + platforms;android-37.0 ile eklentilerin compileSdk = 37
-      # istegi dogal olarak karsilaniyor; pub-cache mudahalesi gerekmiyor.
-      - name: Report SDK / toolchain matrix
+      # ================= 7) compileSdk 37 cikmazi =================
+      # Iki eklenti compileSdk = 37 istiyor ama Google API 37'yi yalnizca
+      # minor surumlu (platforms;android-37.x) yayinliyor ve projenin AGP'si
+      # (8.11.1) "android-37" ariyor. AGP 9.1.1'e cikmak app/build.gradle.kts'in
+      # deprecated DSL'lerini (kotlinOptions, res.srcDir, android {} accessor)
+      # yeniden yazmayi gerektiriyor; bunun yerine iki eklenti 36'ya sabitlenir
+      # ve permission_handler'in API 37 sabitleri SOZDIZIMSEL olarak esdeger
+      # literal ile degistirilir. Tum degisiklik yalnizca efemeral pub-cache'te.
+      - name: Cap plugin compileSdk and shim API 37 constants
+        run: |
+          set -euo pipefail
+          PC="${PUB_CACHE:-$HOME/.pub-cache}/hosted/pub.dev"
+          KTS="$PC/permission_handler_android-14.1.1/android/build.gradle.kts"
+          GRV="$PC/receive_sharing_intent-1.9.0/android/build.gradle"
+          UTIL="$PC/permission_handler_android-14.1.1/android/src/main/java/com/baseflow/permissionhandler/PermissionUtils.java"
+          for f in "$KTS" "$GRV" "$UTIL"; do
+            [ -f "$f" ] || { echo "::error::beklenen dosya yok: $f"; exit 1; }
+          done
+
+          echo "--- once: compileSdk ---"
+          grep -n "compileSdk" "$KTS" "$GRV"
+          sed -i -E "s/^([[:space:]]*compileSdk[[:space:]]*=[[:space:]]*)3[0-9][[:space:]]*$/\136/" "$KTS"
+          sed -i -E "s/^([[:space:]]*compileSdk[[:space:]]+)3[0-9][[:space:]]*$/\136/" "$GRV"
+          echo "--- sonra: compileSdk ---"
+          grep -n "compileSdk" "$KTS" "$GRV" | tee logs/04-compile-sdk-patch.log
+          if grep -qE "compileSdk[[:space:]]*=?[[:space:]]*3[7-9]" "$KTS" "$GRV"; then
+            echo "::error::compileSdk 36'ya sabitlenemedi"; exit 1
+          fi
+
+          # API 37 sabitleri -> anlamsal olarak AYNI literaller
+          #   Manifest.permission.ACCESS_LOCAL_NETWORK == "android.permission.ACCESS_LOCAL_NETWORK"
+          #   Build.VERSION_CODES.CINNAMON_BUN       == 37
+          echo "--- once: API 37 referanslari ---"
+          grep -n "ACCESS_LOCAL_NETWORK\|CINNAMON_BUN" "$UTIL"
+          sed -i \
+            -e 's/Manifest\.permission\.ACCESS_LOCAL_NETWORK/"android.permission.ACCESS_LOCAL_NETWORK"/g' \
+            -e 's/Build\.VERSION_CODES\.CINNAMON_BUN/37/g' \
+            "$UTIL"
+          echo "--- sonra ---"
+          grep -n "ACCESS_LOCAL_NETWORK\|CINNAMON_BUN\|SDK_INT >= 37" "$UTIL" | tee logs/05-api37-shim.log
+          if grep -qE "Manifest\.permission\.ACCESS_LOCAL_NETWORK|Build\.VERSION_CODES\.CINNAMON_BUN" "$UTIL"; then
+            echo "::error::API 37 sabit shim'i uygulanmadi"; exit 1
+          fi
+
+          # 37 isteyen baska eklenti kalmadi mi?
+          if grep -rlE "^[[:space:]]*compileSdk(Version)?[[:space:]]*=?[[:space:]]*3[7-9]([[:space:]]|$)" \
+               "$PC"/*/android/build.gradle* 2>/dev/null | grep -v '\.orig$'; then
+            echo "::error::baska bir eklenti hala compileSdk >= 37 istiyor"; exit 1
+          fi
+          echo "compileSdk + API 37 shim tamam"
+
+      - name: Report toolchain matrix
         run: |
           set -euo pipefail
           echo "Flutter: $FLUTTER_VERSION | JDK: $(java -version 2>&1 | head -1)"
-          grep -nE "compileSdk|ndkVersion" android/app/build.gradle.kts | head -3
-          echo "AGP: $(grep -oE 'com.android.application\"\) version \"[0-9.]+' android/settings.gradle.kts || true)"
           grep -n "distributionUrl" android/gradle/wrapper/gradle-wrapper.properties
-          ls "$ANDROID_HOME/platforms" || true
-          ls -d "$ANDROID_HOME/build-tools"/* || true
-          echo "--- compileSdk isteyen eklentiler ---"
-          grep -rn "compileSdk" "${PUB_CACHE:-$HOME/.pub-cache}"/hosted/pub.dev/permission_handler_android-14.1.1/android/build.gradle.kts \
-            | tee logs/04-plugin-compile-sdk.log
+          grep -nE "com.android.application|kotlin.android" android/settings.gradle.kts
+          grep -nE "compileSdk|ndkVersion" android/app/build.gradle.kts | head -3
+          ls "$ANDROID_HOME/platforms" && ls -d "$ANDROID_HOME/build-tools"/*
 
       # ================= 8) Kod uretimi =================
       - name: Run build_runner
         run: |
           set -euo pipefail
-          dart run build_runner build 2>&1 | tee logs/05-build-runner.log
+          dart run build_runner build 2>&1 | tee logs/06-build-runner.log
           GEN=$(find lib -name "*.g.dart" | wc -l)
           echo "uretilen .g.dart dosya sayisi: $GEN"
           [ "$GEN" -ge 50 ] || { echo "::error::build_runner ciktisi eksik ($GEN)"; exit 1; }
@@ -275,7 +315,7 @@ jobs:
             --dart-define=PUSH_PROVIDER=unifiedpush \
             --dart-define=BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --dart-define=CANARY_NUMBER="${GITHUB_RUN_NUMBER}" \
-            "${EXTRA[@]}" 2>&1 | tee logs/06-build-apk.log
+            "${EXTRA[@]}" 2>&1 | tee logs/07-build-apk.log
 
       # ================= 10) Dogrulama =================
       - name: Verify APK
@@ -284,12 +324,11 @@ jobs:
           APK=$(find build/app/outputs/flutter-apk -name "app-canaryUnifiedpush-debug*.apk" | head -1)
           [ -n "$APK" ] || { echo "::error::APK bulunamadi"; ls -R build/app/outputs || true; exit 1; }
           ls -lh "$APK"
-          AAPT2="$ANDROID_HOME/build-tools/${BUILD_TOOLS_NEW}/aapt2"
-          [ -x "$AAPT2" ] || AAPT2="$ANDROID_HOME/build-tools/${BUILD_TOOLS}/aapt2"
-          "$AAPT2" dump badging "$APK" > logs/07-apk-badging.log
-          PKG=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" logs/07-apk-badging.log)
-          LABEL=$(sed -n "s/^application-label:'\([^']*\)'.*/\1/p" logs/07-apk-badging.log)
-          grep -E "^package:|^application-label:|^launchable-activity:" logs/07-apk-badging.log || true
+          AAPT2="$ANDROID_HOME/build-tools/${BUILD_TOOLS}/aapt2"
+          "$AAPT2" dump badging "$APK" > logs/08-apk-badging.log
+          PKG=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" logs/08-apk-badging.log)
+          LABEL=$(sed -n "s/^application-label:'\([^']*\)'.*/\1/p" logs/08-apk-badging.log)
+          grep -E "^package:|^application-label:|^launchable-activity:" logs/08-apk-badging.log || true
           echo "package=$PKG label=$LABEL"
           [ "$PKG" = "com.nexora.chat.canary" ] || { echo "::error::beklenmeyen paket adi: $PKG"; exit 1; }
           {
