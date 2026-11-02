@@ -1,0 +1,343 @@
+# .github/workflows/android-debug-apk.yml
+# Nexora Android — canaryUnifiedpush DEBUG APK (OSS profili)
+#
+# Tasarim ilkeleri
+#  1) Proje kaynak dosyalarina DOKUNMAZ. "compileSdk 37 vs AGP 8.11.1" cikmazi,
+#     yalnizca CI runner'indaki pub-cache'te (efemeral) 37 -> 36 yamasi ile cozulur.
+#     AGP 8.11.1 / Gradle 8.14 / KGP 2.2.20 / compileSdk 36 korunur.
+#  2) Adim sirasi repo'nun kendi release workflow'u (android-canary-oss.yml) ile aynidir.
+#  3) Secret gerektirmez: debug imzalama repodaki android/app/debug.keystore ile yapilir.
+
+name: Android Debug APK (canaryUnifiedpush)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_platform:
+        description: "Hedef ABI"
+        type: choice
+        options:
+          - all
+          - android-arm64
+        default: all
+      plugin_compile_sdk:
+        description: "Eklentiler icin zorlanacak compileSdk (cikmaz icin 36)"
+        type: string
+        default: "36"
+  push:
+    branches:
+      - nexora-branding
+    paths:
+      - "android/**"
+      - "lib/**"
+      - "packages/**"
+      - "tool/configure_build.dart"
+      - "tool/apply_macos_pub_overrides.sh"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - ".github/workflows/android-debug-apk.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-debug-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.47.9"
+  JAVA_VERSION: "17"
+  COMPILE_SDK: "36"
+  BUILD_TOOLS: "36.0.0"
+  NDK_VERSION: "28.2.13676358"
+  CMAKE_VERSION: "3.22.1"
+
+jobs:
+  build-debug-apk:
+    name: Build canaryUnifiedpush debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # ================= 1) Kaynak =================
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Sync submodules
+        run: |
+          set -euo pipefail
+          git submodule update --init --recursive
+          git submodule status
+          test -f fluxer/packages/markdown_parser/rust/Cargo.toml \
+            || { echo "::error::fluxer crate bulunamadi"; exit 1; }
+          echo "HEAD=$(git rev-parse --short HEAD)"
+
+      # ================= 2) Disk =================
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/lib/android/sdk/system-images /usr/local/lib/android/sdk/ndk \
+                      /usr/local/lib/android/sdk/emulator 2>/dev/null || true
+          sudo apt-get clean
+          docker image prune -af 2>/dev/null || true
+          df -h /
+
+      # ================= 3) JDK + Flutter =================
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Restore Gradle cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-debug-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-debug-
+            ${{ runner.os }}-gradle-
+
+      - name: Cache Flutter SDK
+        id: flutter-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/flutter-sdk
+          key: ${{ runner.os }}-flutter-${{ env.FLUTTER_VERSION }}
+
+      - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/flutter-sdk/bin/flutter" ]; then
+            echo "Flutter $FLUTTER_VERSION indiriliyor"
+            curl -sSL -o /tmp/flutter.tar.xz \
+              "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
+            mkdir -p "$HOME/flutter-sdk"
+            tar xJf /tmp/flutter.tar.xz -C "$HOME/flutter-sdk" --strip-components=1
+            rm -f /tmp/flutter.tar.xz
+            git config --global --add safe.directory "$HOME/flutter-sdk" || true
+          fi
+          echo "$HOME/flutter-sdk/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/flutter-sdk/bin:$PATH"
+          flutter --version
+          dart --version
+
+      - name: Restore pub cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
+      # ================= 4) Android SDK / NDK =================
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -name sdkmanager -type f | head -1)"
+          echo "sdkmanager=$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          for attempt in 1 2 3; do
+            if "$SDKMANAGER" \
+                 "platform-tools" \
+                 "platforms;android-34" \
+                 "platforms;android-35" \
+                 "platforms;android-${COMPILE_SDK}" \
+                 "build-tools;35.0.0" \
+                 "build-tools;${BUILD_TOOLS}" \
+                 "ndk;${NDK_VERSION}" \
+                 "cmake;${CMAKE_VERSION}"; then
+              ok=1; break
+            fi
+            echo "::warning::sdkmanager denemesi ${attempt} basarisiz"
+            sleep 20
+          done
+          [ "${ok:-0}" = "1" ] || { echo "::error::sdkmanager paketleri kurulamadi"; exit 1; }
+          "$SDKMANAGER" --list_installed | grep -E "platforms;|build-tools;|ndk;|cmake;" || true
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          df -h /
+
+      # ================= 5) Rust =================
+      - name: Set up Rust for the native markdown parser
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          . "$HOME/.cargo/env"
+          rustup show active-toolchain || rustup toolchain install stable
+          rustup target add aarch64-linux-android armv7-linux-androideabi \
+                            x86_64-linux-android i686-linux-android
+          cargo --version
+          NDKBIN="$ANDROID_HOME/ndk/${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > "$HOME/.cargo/config.toml" <<EOF
+          [target.aarch64-linux-android]
+          linker = "${NDKBIN}/aarch64-linux-android24-clang"
+
+          [target.armv7-linux-androideabi]
+          linker = "${NDKBIN}/armv7a-linux-androideabi24-clang"
+
+          [target.x86_64-linux-android]
+          linker = "${NDKBIN}/x86_64-linux-android24-clang"
+
+          [target.i686-linux-android]
+          linker = "${NDKBIN}/i686-linux-android24-clang"
+          EOF
+
+      # ================= 6) OSS derleme hazirligi (repo sirasi) =================
+      - name: Configure OSS build tree
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          dart tool/configure_build.dart --profile=oss 2>&1 | tee logs/01-configure-build.log
+
+      - name: Enable native assets
+        run: |
+          set -euo pipefail
+          flutter config --enable-native-assets
+          flutter config --no-analytics > /dev/null 2>&1 || true
+
+      - name: Resolve unifiedpush_linux to the stub
+        run: |
+          set -euo pipefail
+          bash tool/apply_macos_pub_overrides.sh 2>&1 | tee logs/02-pub-overrides.log
+          test -f pubspec_overrides.yaml || { echo "::error::pubspec_overrides.yaml olusmadi"; exit 1; }
+          echo "--- pubspec_overrides.yaml ---"; cat pubspec_overrides.yaml
+
+      - name: Get dependencies
+        run: |
+          set -euo pipefail
+          flutter pub get 2>&1 | tee logs/03-pub-get.log
+
+      # ================= 7) compileSdk 37 cikmazi =================
+      # permission_handler_android 14.1.1 ve receive_sharing_intent 1.9.0
+      # compileSdk 37 istiyor. Google API 37'yi yalnizca minor surumlu
+      # (platforms;android-37.x) yayinliyor; AGP 8.11.1 "android-37"
+      # hash'ini bulamadigi icin derleme kiriliyor. Proje dosyalari yerine
+      # yalnizca efemeral pub-cache duzeltilir.
+      - name: Patch plugin compileSdk 37 -> ${{ inputs.plugin_compile_sdk || '36' }}
+        run: |
+          set -euo pipefail
+          CAP="${{ inputs.plugin_compile_sdk || '36' }}"
+          PC="${PUB_CACHE:-$HOME/.pub-cache}/hosted/pub.dev"
+          KTS="$PC/permission_handler_android-14.1.1/android/build.gradle.kts"
+          GRV="$PC/receive_sharing_intent-1.9.0/android/build.gradle"
+          for f in "$KTS" "$GRV"; do
+            [ -f "$f" ] || { echo "::error::eklenti dosyasi bulunamadi: $f"; exit 1; }
+          done
+          echo "--- once ---"; grep -n "compileSdk" "$KTS" "$GRV"
+          sed -i -E "s/^([[:space:]]*compileSdk[[:space:]]*=[[:space:]]*)3[0-9][[:space:]]*$/\1${CAP}/" "$KTS"
+          sed -i -E "s/^([[:space:]]*compileSdk[[:space:]]+)3[0-9][[:space:]]*$/\1${CAP}/" "$GRV"
+          echo "--- sonra ---"; grep -n "compileSdk" "$KTS" "$GRV" | tee logs/04-compile-sdk-patch.log
+          if grep -qE "^[[:space:]]*compileSdk[[:space:]]*=?[[:space:]]*3[7-9]([[:space:]]|$)" "$KTS" "$GRV"; then
+            echo "::error::compileSdk >= 37 yamasi uygulanmadi"; exit 1
+          fi
+          # 37 isteyen baska eklenti kalmadi mi?
+          if grep -rlE "^[[:space:]]*compileSdk(Version)?[[:space:]]*=?[[:space:]]*3[7-9]([[:space:]]|$)" \
+               "$PC"/*/android/build.gradle* 2>/dev/null | grep -v '\.orig$'; then
+            echo "::error::baska bir eklenti hala compileSdk >= 37 istiyor"; exit 1
+          fi
+          echo "compileSdk yamasi tamam"
+
+      # ================= 8) Kod uretimi =================
+      - name: Run build_runner
+        run: |
+          set -euo pipefail
+          dart run build_runner build 2>&1 | tee logs/05-build-runner.log
+          GEN=$(find lib -name "*.g.dart" | wc -l)
+          echo "uretilen .g.dart dosya sayisi: $GEN"
+          [ "$GEN" -ge 50 ] || { echo "::error::build_runner ciktisi eksik ($GEN)"; exit 1; }
+          if [ -f lib/core/database/fluxer_database.g.dart ]; then
+            LINES=$(wc -l < lib/core/database/fluxer_database.g.dart)
+            echo "fluxer_database.g.dart satir sayisi: $LINES"
+            [ "$LINES" -ge 100 ] || { echo "::error::drift ciktisi eksik"; exit 1; }
+          fi
+
+      # ================= 9) Debug APK =================
+      - name: Build debug APK (canaryUnifiedpush)
+        run: |
+          set -euo pipefail
+          chmod +x android/gradlew
+          EXTRA=()
+          if [ "${{ inputs.target_platform || 'all' }}" != "all" ]; then
+            EXTRA+=("--target-platform" "${{ inputs.target_platform }}")
+          fi
+          flutter build apk \
+            --debug \
+            --flavor canaryUnifiedpush \
+            --build-number "${GITHUB_RUN_NUMBER}" \
+            --dart-define-from-file=tool/dart_defines/canary.json \
+            --dart-define=PUSH_PROVIDER=unifiedpush \
+            --dart-define=BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --dart-define=CANARY_NUMBER="${GITHUB_RUN_NUMBER}" \
+            "${EXTRA[@]}" 2>&1 | tee logs/06-build-apk.log
+
+      # ================= 10) Dogrulama =================
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK=$(find build/app/outputs/flutter-apk -name "app-canaryUnifiedpush-debug*.apk" | head -1)
+          [ -n "$APK" ] || { echo "::error::APK bulunamadi"; ls -R build/app/outputs || true; exit 1; }
+          ls -lh "$APK"
+          AAPT2="$ANDROID_HOME/build-tools/${BUILD_TOOLS}/aapt2"
+          "$AAPT2" dump badging "$APK" > logs/07-apk-badging.log
+          PKG=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" logs/07-apk-badging.log)
+          LABEL=$(sed -n "s/^application-label:'\([^']*\)'.*/\1/p" logs/07-apk-badging.log)
+          grep -E "^package:|^application-label:|^launchable-activity:" logs/07-apk-badging.log || true
+          echo "package=$PKG label=$LABEL"
+          [ "$PKG" = "com.nexora.chat.canary" ] || { echo "::error::beklenmeyen paket adi: $PKG"; exit 1; }
+          {
+            echo "## APK hazir"
+            echo ""
+            echo "| Alan | Deger |"
+            echo "|---|---|"
+            echo "| Dosya | \`$(basename "$APK")\` |"
+            echo "| Boyut | $(du -h "$APK" | cut -f1) |"
+            echo "| package | \`$PKG\` |"
+            echo "| label | $LABEL |"
+            echo "| Flutter | $FLUTTER_VERSION |"
+            echo "| Commit | \`${GITHUB_SHA:0:7}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ================= 11) Artefaktlar =================
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: nexora-canary-unifiedpush-debug-apk
+          path: build/app/outputs/flutter-apk/app-canaryUnifiedpush-debug*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: nexora-debug-apk-logs
+          path: |
+            logs/**
+            ~/.gradle/daemon/**/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Failure summary
+        if: failure()
+        run: |
+          {
+            echo "## Derleme basarisiz"
+            echo ""
+            echo "Basarisiz adim icin log artefaktina bakin: \`nexora-debug-apk-logs\`"
+            echo ""
+            echo '```'
+            tail -50 logs/*.log 2>/dev/null || echo "log yok"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
