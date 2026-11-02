@@ -1,4 +1,4 @@
-name: nexora
+name: fluxer_app
 description: "Official Fluxer Mobile client built on the Flutter framework"
 publish_to: "none" # Remove this line if you wish to publish to pub.dev
 
