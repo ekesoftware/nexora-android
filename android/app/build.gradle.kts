@@ -112,7 +112,7 @@ val copyBundledRootCertificates = tasks.register<Copy>("copyBundledRootCertifica
 
 android {
     namespace = "com.fluxer"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 37  // API 37.0: platforms;android-37.0 kurulmalidir
     ndkVersion = flutter.ndkVersion
     flavorDimensions += listOf("environment", "push")
 
